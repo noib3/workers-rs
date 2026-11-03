@@ -1,10 +1,9 @@
-use crate::http::body::Body;
+use crate::http::body::{into_readable_stream, Body};
 use crate::Cf;
 use crate::Result;
 use crate::{http::redirect::RequestRedirect, AbortSignal};
 use worker_sys::ext::RequestExt;
 
-use crate::http::body::BodyStream;
 use crate::http::header::{header_map_from_web_sys_headers, web_sys_headers_from_header_map};
 use bytes::Bytes;
 
@@ -50,6 +49,9 @@ pub fn from_wasm(req: web_sys::Request) -> Result<http::Request<Body>> {
 
 /// **Requires** `http` feature. Convert [`http::Request`](http::Request)
 /// to [`web_sys::Request`](web_sys::Request)
+///
+/// If the body is a [`Body`] that hasn't been read yet, its stream is handed
+/// to the runtime as is instead of being streamed through Wasm.
 pub fn to_wasm<B: http_body::Body<Data = Bytes> + 'static>(
     mut req: http::Request<B>,
 ) -> Result<web_sys::Request> {
@@ -80,10 +82,8 @@ pub fn to_wasm<B: http_body::Body<Data = Bytes> + 'static>(
         let _ = r;
     }
 
-    let body = req.into_body();
-    if !body.is_end_stream() {
-        let readable_stream =
-            wasm_streams::ReadableStream::from_stream(BodyStream::new(body)).into_raw();
+    let (mut parts, body) = req.into_parts();
+    if let Some(readable_stream) = into_readable_stream(body, &mut parts.extensions) {
         init.set_body(readable_stream.as_ref());
     }
 

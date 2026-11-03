@@ -1,11 +1,10 @@
 use super::header::{header_map_from_web_sys_headers, web_sys_headers_from_header_map};
-use crate::http::body::Body;
+use crate::http::body::{into_readable_stream, Body};
 use crate::HttpResponse;
 use crate::Result;
 use crate::WebSocket;
 use bytes::Bytes;
 
-use crate::http::body::BodyStream;
 use crate::response::EncodeBody;
 use crate::CfResponseProperties;
 use crate::Headers;
@@ -14,6 +13,10 @@ use worker_sys::ext::ResponseExt;
 
 /// **Requires** `http` feature. Convert generic [`http::Response<B>`](crate::HttpResponse)
 /// to [`web_sys::Response`](web_sys::Response) where `B` can be any [`http_body::Body`](http_body::Body)
+///
+/// If the body is a [`Body`] that hasn't been read yet, or the response went
+/// through [`passthrough`], its stream is handed to the runtime as is instead
+/// of being streamed through Wasm.
 pub fn to_wasm<B>(mut res: http::Response<B>) -> Result<web_sys::Response>
 where
     B: http_body::Body<Data = Bytes> + 'static,
@@ -33,17 +36,8 @@ where
         init = init.with_cf_raw(obj);
     }
 
-    let body = res.into_body();
-    // I'm not sure how we are supposed to determine if there is no
-    // body for an `http::Response`, seems like this may be the only
-    // option given the trait? This appears to work for things like
-    // `hyper::Empty`.
-    let readable_stream = if body.is_end_stream() {
-        None
-    } else {
-        let stream = BodyStream::new(body);
-        Some(wasm_streams::ReadableStream::from_stream(stream).into_raw())
-    };
+    let (mut parts, body) = res.into_parts();
+    let readable_stream = into_readable_stream(body, &mut parts.extensions);
 
     Ok(web_sys::Response::new_with_opt_readable_stream_and_init(
         readable_stream.as_ref(),
@@ -70,6 +64,27 @@ pub fn from_wasm(res: web_sys::Response) -> Result<HttpResponse> {
     } else {
         builder.body(Body::empty())?
     })
+}
+
+/// **Requires** `http` feature. Make [`to_wasm`] hand the response's body to
+/// the runtime as is, instead of streaming it through Wasm, even after the
+/// body's type has been erased, e.g. by converting the response into an
+/// `axum` one.
+///
+/// This avoids copying every chunk of the body into Wasm memory and back, e.g.
+/// when returning the response of a subrequest, or an object read from R2, KV
+/// or the Cache API. [`to_wasm`] already does that if it gets the [`Body`]
+/// itself.
+///
+/// If the body is read, or dropped (for example because a middleware replaced
+/// it) before reaching [`to_wasm`], it's streamed through Wasm as usual. A
+/// middleware that wraps the body without reading it, e.g. to compress it, is
+/// bypassed, so only use this for bodies that must reach the client untouched.
+pub fn passthrough(mut res: HttpResponse) -> HttpResponse {
+    if let Some(unread) = res.body().unread_stream() {
+        res.extensions_mut().insert(unread);
+    }
+    res
 }
 
 #[cfg(feature = "axum")]
